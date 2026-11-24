@@ -111,7 +111,7 @@ def cmd_extract(a):
             f = bb.predict(preprocess(sample_frames(p)), verbose=0)   # (T,1280)
         except Exception as e:           # 깨진 영상은 건너뜀
             skipped.append(p); print("skip", p, e); continue
-        X.append(f); y.append(l); names.append(os.path.relpath(p, a.data))
+        X.append(f); y.append(l); names.append(os.path.relpath(p, a.data).replace("\\", "/"))
         if i % 20 == 0:
             print(f"{i + 1}/{len(paths)}")
     np.savez_compressed(os.path.join(a.out, "feats.npz"),
@@ -127,14 +127,33 @@ def group_of(name):
     return base          # 기본: 파일 하나가 한 그룹. 같은 원본에서 잘린 클립이 있다면 여기서 원본 ID로 묶으세요.
 
 
-def split(names, y):
-    """경로에 Train / Test 폴더가 있으면 공식 분할을 그대로 사용 (같은 원본에서 잘린 클립 누수 방지).
-    Train 안에서 15%를 val(early stopping용)로 쓰고, Test는 최종 평가에만 사용.
-    Train/Test 폴더가 없으면 파일 단위 그룹 랜덤 분할."""
+def split(names, y, ignore_test=False, block=0):
+    """분할 방식
+    - 기본: 경로에 Train / Test 폴더가 있으면 공식 분할 사용.
+    - ignore_test=True: Test 폴더는 버리고(SCVD의 Test는 Train의 복사본이라 평가에 쓸 수 없음)
+      Train 안에서만 그룹 단위로 나눔. 그룹 = (클래스 폴더, 파일 번호 // block).
+      같은 원본에서 잘린 연속 번호 클립이 train/test로 갈라지는 것을 막기 위함. block=0이면 파일 하나가 한 그룹.
+    - Train/Test 폴더가 없으면 파일 단위 랜덤 그룹 분할."""
+    import re
     from sklearn.model_selection import GroupShuffleSplit, train_test_split
-    parts = [set(p.lower() for p in os.path.normpath(n).split(os.sep)) for n in names]
+    parts = [set(p.lower() for p in str(n).replace("\\", "/").split("/")) for n in names]
     is_te = np.array(["test" in p for p in parts])
     is_tr = np.array(["train" in p for p in parts])
+    if ignore_test:
+        pool = np.where(is_tr)[0] if is_tr.any() else np.arange(len(names))
+        def grp(n):
+            n = str(n).replace("\\", "/")
+            folder = n.rsplit("/", 1)[0]
+            m = re.search(r"(\d+)\.[A-Za-z0-9]+$", n)
+            k = int(m.group(1)) if m else hash(n)
+            return f"{folder}#{k // block if block else k}"
+        g = np.array([grp(names[i]) for i in pool])
+        gss = GroupShuffleSplit(1, test_size=0.2, random_state=SEED)
+        a, te = next(gss.split(pool, y[pool], g))
+        gss2 = GroupShuffleSplit(1, test_size=0.15, random_state=SEED)
+        b, va = next(gss2.split(pool[a], y[pool[a]], g[a]))
+        print(f"Train 폴더만 사용, 그룹 분할 (block={block}), 그룹 수 {len(set(g))}")
+        return pool[a][b], pool[a][va], pool[te]
     if is_te.any() and is_tr.any():
         te = np.where(is_te)[0]
         trval = np.where(is_tr)[0]
@@ -166,7 +185,7 @@ def cmd_train(a):
     os.makedirs(a.out, exist_ok=True)
     d = np.load(os.path.join(a.feats, "feats.npz"))
     X, y, names = d["X"], d["y"], d["names"]
-    tr, va, te = split(names, y)
+    tr, va, te = split(names, y, a.ignore_test, a.block)
     print(f"train {len(tr)} / val {len(va)} / test {len(te)}")
     for nm, ix in (("train", tr), ("val", va), ("test", te)):
         print(f"  {nm}: 비폭력 {(y[ix] == 0).sum()} / 폭력 {(y[ix] == 1).sum()}")
@@ -186,6 +205,30 @@ def cmd_train(a):
         print(name, results[name])
     with open(os.path.join(a.out, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------- 2-b) 외부 데이터 평가
+def cmd_eval(a):
+    """학습에 쓰지 않은 외부 데이터셋(feats.npz)으로 저장된 모델들을 평가.
+    사전에: python rvd_pipeline.py extract --data <외부데이터 폴더> --out feats_ext"""
+    import tensorflow as tf
+    from sklearn.metrics import roc_auc_score
+    d = np.load(a.feats); X, y = d["X"], d["y"]
+    print(f"외부 데이터 {len(y)}개 | 비폭력(0) {(y == 0).sum()} / 폭력(1) {(y == 1).sum()}")
+    out = {}
+    for mp in sorted(glob.glob(os.path.join(a.models, "*.keras"))):
+        name = os.path.basename(mp)[:-6]
+        m = tf.keras.models.load_model(mp)
+        prob = m.predict(X, verbose=0).ravel()
+        r = metrics(y, prob, a.thr)
+        r["roc_auc"] = float(roc_auc_score(y, prob)) if len(set(y)) == 2 else None
+        r["mean_prob_nonviolence"] = float(prob[y == 0].mean()) if (y == 0).any() else None
+        r["mean_prob_violence"] = float(prob[y == 1].mean()) if (y == 1).any() else None
+        out[name] = r
+        print(name, {k: (round(v, 4) if isinstance(v, float) else v) for k, v in r.items()})
+    os.makedirs(a.out, exist_ok=True)
+    with open(os.path.join(a.out, f"external_{a.tag}.json"), "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------- 3) 속도
@@ -229,7 +272,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     sp = ap.add_subparsers(dest="cmd", required=True)
     e = sp.add_parser("extract"); e.add_argument("--data", required=True); e.add_argument("--out", default="feats"); e.add_argument("--neg", default=""); e.add_argument("--dry-run", action="store_true")
-    t = sp.add_parser("train"); t.add_argument("--feats", default="feats"); t.add_argument("--out", default="results"); t.add_argument("--epochs", type=int, default=50)
+    t = sp.add_parser("train"); t.add_argument("--feats", default="feats"); t.add_argument("--out", default="results"); t.add_argument("--epochs", type=int, default=50); t.add_argument("--ignore-test", action="store_true"); t.add_argument("--block", type=int, default=0)
+    v = sp.add_parser("eval"); v.add_argument("--feats", required=True); v.add_argument("--models", default="results"); v.add_argument("--out", default="results"); v.add_argument("--tag", default="external"); v.add_argument("--thr", type=float, default=0.5)
     s = sp.add_parser("speed"); s.add_argument("--data", required=True); s.add_argument("--out", default="results"); s.add_argument("--n", type=int, default=30)
     a = ap.parse_args()
-    {"extract": cmd_extract, "train": cmd_train, "speed": cmd_speed}[a.cmd](a)
+    {"extract": cmd_extract, "train": cmd_train, "eval": cmd_eval, "speed": cmd_speed}[a.cmd](a)
