@@ -128,12 +128,25 @@ def group_of(name):
 
 
 def split(names, y):
-    from sklearn.model_selection import GroupShuffleSplit
+    """경로에 Train / Test 폴더가 있으면 공식 분할을 그대로 사용 (같은 원본에서 잘린 클립 누수 방지).
+    Train 안에서 15%를 val(early stopping용)로 쓰고, Test는 최종 평가에만 사용.
+    Train/Test 폴더가 없으면 파일 단위 그룹 랜덤 분할."""
+    from sklearn.model_selection import GroupShuffleSplit, train_test_split
+    parts = [set(p.lower() for p in os.path.normpath(n).split(os.sep)) for n in names]
+    is_te = np.array(["test" in p for p in parts])
+    is_tr = np.array(["train" in p for p in parts])
+    if is_te.any() and is_tr.any():
+        te = np.where(is_te)[0]
+        trval = np.where(is_tr)[0]
+        tr, va = train_test_split(trval, test_size=0.15, random_state=SEED, stratify=y[trval])
+        print("공식 Train/Test 분할 사용")
+        return tr, va, te
     g = np.array([group_of(n) for n in names])
     gss = GroupShuffleSplit(1, test_size=0.2, random_state=SEED)
     trval, te = next(gss.split(names, y, g))
     gss2 = GroupShuffleSplit(1, test_size=0.15, random_state=SEED)
     tr, va = next(gss2.split(trval, y[trval], g[trval]))
+    print("Train/Test 폴더 없음 -> 랜덤 그룹 분할")
     return trval[tr], trval[va], te
 
 
