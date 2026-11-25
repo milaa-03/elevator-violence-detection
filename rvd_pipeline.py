@@ -231,6 +231,170 @@ def cmd_eval(a):
         json.dump(out, f, indent=2, ensure_ascii=False)
 
 
+# ---------------------------------------------------------------- 2-c) End-to-end 파인튜닝
+def _tcn_on(x, filters=64, kernel=3, dilations=(1, 2, 4)):
+    import tensorflow as tf
+    L = tf.keras.layers
+    x = L.Conv1D(filters, 1)(x)
+    for dl in dilations:
+        h = L.Conv1D(filters, kernel, padding="causal", dilation_rate=dl, activation="relu")(x)
+        h = L.SpatialDropout1D(0.2)(h)
+        h = L.Conv1D(filters, kernel, padding="causal", dilation_rate=dl, activation="relu")(h)
+        h = L.SpatialDropout1D(0.2)(h)
+        x = L.Activation("relu")(L.Add()([x, h]))
+    return L.Dense(64, activation="relu")(L.GlobalAveragePooling1D()(x))
+
+
+def build_e2e(kind, size=SIZE, t=T):
+    """입력: uint8 프레임 (t,size,size,3) -> MobileNetV2(프레임별) -> LSTM|TCN -> 폭력 확률. 전처리 포함."""
+    import tensorflow as tf
+    L = tf.keras.layers
+    base = tf.keras.applications.MobileNetV2(
+        include_top=False, weights=(os.environ.get("RVD_WEIGHTS", "imagenet") or None),
+        pooling="avg", input_shape=(size, size, 3))
+    inp = L.Input((t, size, size, 3), dtype="uint8")
+    x = L.Rescaling(1 / 127.5, offset=-1)(inp)          # mobilenet_v2 preprocess_input 과 동일
+    x = L.TimeDistributed(base)(x)
+    if kind == "LSTM":
+        x = L.LSTM(128)(x); x = L.Dropout(0.5)(x); x = L.Dense(64, activation="relu")(x)
+    else:
+        x = _tcn_on(x)
+    out = L.Dense(1, activation="sigmoid")(x)
+    return tf.keras.Model(inp, out, name=f"mobilenetv2_{kind.lower()}_e2e"), base
+
+
+def _set_trainable(base, n):
+    """MobileNetV2 학습 대상 설정. n=0: 전부 고정 / n>0: 마지막 n개 층만 / n<0: 전체 층(완전 학습).
+    BatchNorm은 항상 고정(작은 데이터에서 통계가 흔들리는 것을 방지)."""
+    import tensorflow as tf
+    base.trainable = n != 0
+    if n != 0:
+        target = base.layers if n < 0 else base.layers[-n:]
+        for l in base.layers:
+            l.trainable = False
+        for l in target:
+            if not isinstance(l, tf.keras.layers.BatchNormalization):
+                l.trainable = True
+
+
+def _augment(x, size):
+    """클립 전체에 같은 변환(좌우반전, 밝기/대비, 랜덤 크롭 후 리사이즈)을 적용."""
+    import tensorflow as tf
+    x = tf.cast(x, tf.float32)
+    x = tf.cond(tf.random.uniform(()) < 0.5, lambda: x[:, :, ::-1, :], lambda: x)
+    x = tf.image.random_brightness(x, 25.0)
+    x = tf.image.random_contrast(x, 0.8, 1.2)
+    ch = tf.random.uniform((), int(size * 0.8), size + 1, dtype=tf.int32)
+    x = tf.image.random_crop(x, tf.stack([T, ch, ch, 3]))
+    x = tf.image.resize(x, (size, size))
+    return tf.cast(tf.clip_by_value(x, 0.0, 255.0), tf.uint8)
+
+
+def _make_ds(F, y, idx, batch, train, size):
+    import tensorflow as tf
+    def gen():
+        order = np.random.permutation(idx) if train else idx
+        for i in order:
+            yield F[i], np.float32(y[i])
+    sig = (tf.TensorSpec((T, size, size, 3), tf.uint8), tf.TensorSpec((), tf.float32))
+    ds = tf.data.Dataset.from_generator(gen, output_signature=sig)
+    if train:
+        ds = ds.map(lambda x, l: (_augment(x, size), l), num_parallel_calls=tf.data.AUTOTUNE)
+    return ds.batch(batch).prefetch(tf.data.AUTOTUNE)
+
+
+def _breakdown(names, y, prob, keys, thr=0.5):
+    """Test 를 출처별로 나눠 지표 계산. keys: 경로에 포함될 키워드 목록(소문자). 어느 키에도 안 걸리면 'other'."""
+    from sklearn.metrics import roc_auc_score
+    names = np.array([str(n).lower() for n in names])
+    out = {}
+    assigned = np.zeros(len(names), dtype=bool)
+    groups = []
+    for k in keys:
+        m = np.array([k in n for n in names]) & ~assigned
+        groups.append((k, m)); assigned |= m
+    groups.append(("other", ~assigned))
+    for k, m in groups:
+        if m.sum() == 0:
+            continue
+        r = metrics(y[m], prob[m], thr)
+        r["n"] = int(m.sum())
+        r["roc_auc"] = float(roc_auc_score(y[m], prob[m])) if len(set(y[m])) == 2 else None
+        out[k] = r
+    return out
+
+
+def _save_preds(path, names, y, prob):
+    import csv
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f); w.writerow(["name", "label", "prob", "pred_at_0.5"])
+        for n, l, p in zip(names, y, prob):
+            w.writerow([n, int(l), round(float(p), 4), int(p >= 0.5)])
+
+
+def cmd_finetune(a):
+    """MobileNetV2 + LSTM/TCN 을 한 모델로 학습. 1단계: MobileNetV2 고정하고 헤드만, 2단계: 마지막 N개 층 해제 + 낮은 학습률."""
+    import tensorflow as tf
+    from sklearn.metrics import roc_auc_score
+    tf.keras.utils.set_random_seed(SEED)
+    os.makedirs(a.out, exist_ok=True)
+    cache = os.path.join(a.out, f"frames_{a.size}.npz")
+    if os.path.exists(cache):
+        d = np.load(cache); F, y, names = d["F"], d["y"], d["names"]
+        print("프레임 캐시 사용:", cache)
+    else:
+        paths = sorted(p for p in glob.glob(os.path.join(a.data, "**", "*"), recursive=True) if p.lower().endswith(VIDEO_EXT))
+        neg = tuple(a.neg.split(",")) if a.neg else NEG_KEYWORDS
+        Fl, yl, names = [], [], []
+        for i, p in enumerate(paths):
+            try:
+                Fl.append(sample_frames(p, T, a.size))
+            except Exception as e:
+                print("skip", p, e); continue
+            rel = os.path.relpath(p, a.data).replace("\\", "/")
+            yl.append(label_of(rel, neg)); names.append(rel)
+            if i % 50 == 0:
+                print(f"프레임 추출 {i + 1}/{len(paths)}")
+        F, y, names = np.stack(Fl), np.array(yl), np.array(names)
+        np.savez(cache, F=F, y=y, names=names)
+        print("프레임 캐시 저장:", cache, F.shape)
+    tr, va, te = split(names, y, a.ignore_test, a.block)
+    print(f"train {len(tr)} / val {len(va)} / test {len(te)}")
+    for nm, ix in (("train", tr), ("val", va), ("test", te)):
+        print(f"  {nm}: 비폭력 {(y[ix] == 0).sum()} / 폭력 {(y[ix] == 1).sum()}")
+    w = {c: len(tr) / (2 * max((y[tr] == c).sum(), 1)) for c in (0, 1)}
+    ds_tr = _make_ds(F, y, tr, a.batch, True, a.size)
+    ds_va = _make_ds(F, y, va, a.batch, False, a.size)
+    ds_te = _make_ds(F, y, te, a.batch, False, a.size)
+    results = {}
+    for kind in ["LSTM", "TCN"]:
+        m, base = build_e2e(kind, a.size)
+        _set_trainable(base, 0)
+        m.compile(tf.keras.optimizers.Adam(1e-3), "binary_crossentropy", metrics=["accuracy"])
+        print(f"[{kind}] 1단계: MobileNetV2 고정, 헤드만 {a.warmup} epoch")
+        m.fit(ds_tr, validation_data=ds_va, epochs=a.warmup, class_weight=w, verbose=2)
+        _set_trainable(base, a.unfreeze)
+        m.compile(tf.keras.optimizers.Adam(a.lr), "binary_crossentropy", metrics=["accuracy"])
+        print(f"[{kind}] 2단계: MobileNetV2 " + ("전체 층" if a.unfreeze < 0 else f"마지막 {a.unfreeze}개 층") + f" 해제, lr={a.lr}")
+        cb = [tf.keras.callbacks.EarlyStopping("val_loss", patience=5, restore_best_weights=True)]
+        m.fit(ds_tr, validation_data=ds_va, epochs=a.epochs, class_weight=w, callbacks=cb, verbose=2)
+        m.save(os.path.join(a.out, f"E2E_MobileNetV2_{kind}.keras"))
+        prob = m.predict(ds_te, verbose=0).ravel()
+        r = metrics(y[te], prob)
+        r["roc_auc"] = float(roc_auc_score(y[te], prob)) if len(set(y[te])) == 2 else None
+        r["params"] = int(m.count_params())
+        keys = [k.strip().lower() for k in a.sources.split(",") if k.strip()]
+        if keys:
+            r["by_source"] = _breakdown(names[te], y[te], prob, keys)
+        _save_preds(os.path.join(a.out, f"preds_{kind}.csv"), names[te], y[te], prob)
+        results[f"E2E MobileNetV2+{kind}"] = r
+        print(f"E2E MobileNetV2+{kind}", {k: (round(v, 4) if isinstance(v, float) else v) for k, v in r.items() if k != "by_source"})
+        for k, v in r.get("by_source", {}).items():
+            print(f"   [{k}] n={v['n']}", {kk: (round(vv, 4) if isinstance(vv, float) else vv) for kk, vv in v.items() if kk != "n"})
+    with open(os.path.join(a.out, "metrics_finetune.json"), "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+
+
 # ---------------------------------------------------------------- 3) 속도
 def cmd_speed(a):
     """end-to-end(프레임 전처리 + MobileNetV2 + 시계열 모델) 추론 시간과 FPS.
@@ -268,12 +432,42 @@ def cmd_speed(a):
         json.dump(out, f, indent=2, ensure_ascii=False)
 
 
+def cmd_speed_e2e(a):
+    """end-to-end 모델(영상 프레임 입력)의 추론 시간/FPS. 전처리(프레임 읽기+리사이즈)와 모델 추론을 나눠서 측정."""
+    import tensorflow as tf
+    os.makedirs(a.out, exist_ok=True)
+    m = tf.keras.models.load_model(a.model)
+    size = int(m.input_shape[2])
+    vids = sorted(p for p in glob.glob(os.path.join(a.data, "**", "*"), recursive=True) if p.lower().endswith(VIDEO_EXT))[: a.n]
+    t_read, t_model = [], []
+    for v in vids[:3]:
+        m(sample_frames(v, T, size)[None], training=False)          # warm-up
+    for v in vids:
+        s0 = time.perf_counter(); x = sample_frames(v, T, size)[None]; t_read.append(time.perf_counter() - s0)
+        s0 = time.perf_counter(); m(x, training=False).numpy(); t_model.append(time.perf_counter() - s0)
+    tot = np.array(t_read) + np.array(t_model)
+    r = dict(model=os.path.basename(a.model), clips=len(vids), frames_per_clip=T,
+             read_resize_ms=float(np.median(t_read) * 1e3), model_ms=float(np.median(t_model) * 1e3),
+             inference_ms_median=float(np.median(tot) * 1e3), inference_ms_p95=float(np.percentile(tot, 95) * 1e3),
+             fps=float(T / np.median(tot)), fps_model_only=float(T / np.median(t_model)),
+             env=dict(tf=tf.__version__, cpu_count=os.cpu_count(), gpu=[g.name for g in tf.config.list_physical_devices("GPU")]))
+    print(r)
+    with open(os.path.join(a.out, "speed_" + os.path.basename(a.model).replace(".keras", "") + ".json"), "w", encoding="utf-8") as f:
+        json.dump(r, f, indent=2, ensure_ascii=False)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     sp = ap.add_subparsers(dest="cmd", required=True)
     e = sp.add_parser("extract"); e.add_argument("--data", required=True); e.add_argument("--out", default="feats"); e.add_argument("--neg", default=""); e.add_argument("--dry-run", action="store_true")
     t = sp.add_parser("train"); t.add_argument("--feats", default="feats"); t.add_argument("--out", default="results"); t.add_argument("--epochs", type=int, default=50); t.add_argument("--ignore-test", action="store_true"); t.add_argument("--block", type=int, default=0)
     v = sp.add_parser("eval"); v.add_argument("--feats", required=True); v.add_argument("--models", default="results"); v.add_argument("--out", default="results"); v.add_argument("--tag", default="external"); v.add_argument("--thr", type=float, default=0.5)
+    ft = sp.add_parser("finetune"); ft.add_argument("--data", required=True); ft.add_argument("--out", default="results_ft"); ft.add_argument("--size", type=int, default=224)
+    ft.add_argument("--epochs", type=int, default=30); ft.add_argument("--warmup", type=int, default=3); ft.add_argument("--unfreeze", type=int, default=-1, help="-1: MobileNetV2 전체 학습, N: 마지막 N개 층, 0: 고정")
+    ft.add_argument("--lr", type=float, default=1e-5); ft.add_argument("--batch", type=int, default=4); ft.add_argument("--neg", default="")
+    ft.add_argument("--ignore-test", action="store_true"); ft.add_argument("--block", type=int, default=0)
+    ft.add_argument("--sources", default="rlvd", help="Test 를 출처별로 나눌 경로 키워드(쉼표 구분, 소문자). 예: rlvd. 빈 문자열이면 생략")
+    se = sp.add_parser("speed-e2e"); se.add_argument("--model", required=True); se.add_argument("--data", required=True); se.add_argument("--out", default="results_ft"); se.add_argument("--n", type=int, default=30)
     s = sp.add_parser("speed"); s.add_argument("--data", required=True); s.add_argument("--out", default="results"); s.add_argument("--n", type=int, default=30)
     a = ap.parse_args()
-    {"extract": cmd_extract, "train": cmd_train, "eval": cmd_eval, "speed": cmd_speed}[a.cmd](a)
+    {"extract": cmd_extract, "train": cmd_train, "eval": cmd_eval, "speed": cmd_speed, "finetune": cmd_finetune, "speed-e2e": cmd_speed_e2e}[a.cmd](a)
